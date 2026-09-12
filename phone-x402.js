@@ -180,6 +180,134 @@
     return value;
   }
 
+  function createHumanWalletFlow(options) {
+    const params = options.params;
+    const resourceUrl = params.get("x402Resource") || "";
+    const network = params.get("x402Network") || "";
+    const version = Number(params.get("x402Version") || "0");
+    const sessionLabel = params.get("session") || "";
+    const machineLabel = params.get("machineLabel") || "";
+    const confirmations = Number(params.get("confirmations") || "0");
+    let paymentRequired = null;
+    let accepted = null;
+    let transaction = null;
+    let payer = null;
+
+    function expected() {
+      const invoice = options.getInvoice();
+      return {
+        resourceUrl: resourceUrl,
+        network: network,
+        chainId: invoice.chainId,
+        amount: String(invoice.amount),
+        maximumAmount: "20000000000000000",
+        registry: invoice.contract,
+        sessionId: sessionLabel,
+        sessionIdBytes32: invoice.sessionId,
+        machineId: machineLabel,
+        machineIdBytes32: invoice.machineId,
+        deadline: invoice.deadline,
+        confirmations: confirmations,
+      };
+    }
+
+    async function report(event, details) {
+      if (!resourceUrl) return false;
+      const controller = new AbortController();
+      const timer = globalThis.setTimeout(function () { controller.abort(); }, 1500);
+      try {
+        const endpoint = new URL("/x402/client-event/" + encodeURIComponent(sessionLabel), resourceUrl);
+        const response = await fetch(endpoint.toString(), {
+          method: "POST", cache: "no-store", credentials: "omit", signal: controller.signal,
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(Object.assign({ event: event }, details || {})),
+        });
+        return response.ok;
+      } catch (_) {
+        return false; // Observational telemetry cannot govern payment.
+      } finally {
+        globalThis.clearTimeout(timer);
+      }
+    }
+
+    async function verify() {
+      if (!resourceUrl) return true;
+      requireValue(version === 2 && sessionLabel && machineLabel && [1, 2].includes(confirmations), "incomplete human-wallet x402 invoice");
+      options.showTerms("Checking payment terms...");
+      options.setStatus("Reading the x402 payment request…");
+      await report("phone_page_opened");
+      const response = await fetch(resourceUrl, { method: "GET", cache: "no-store", credentials: "omit" });
+      const header = response.headers.get("PAYMENT-REQUIRED");
+      requireValue(response.status === 402 && header, "server did not return HTTP 402 with PAYMENT-REQUIRED");
+      paymentRequired = decodeHeader(header);
+      accepted = validatePaymentRequired(paymentRequired, expected());
+      options.applyTransactionTerms(transactionFromRequirement(accepted));
+      options.showTerms("Payment terms verified");
+      await report("terms_verified");
+      options.setStatus("x402 payment terms verified.\nTap Pay with MetaMask when you are ready.", "ok");
+      return true;
+    }
+
+    function transactionTerms() {
+      requireValue(accepted, "x402 payment terms are not verified");
+      requireValue(!transaction, "this page already submitted its one payment");
+      return transactionFromRequirement(accepted);
+    }
+
+    async function transactionSubmitted(txRef, from) {
+      transaction = txRef;
+      payer = from;
+      await report("transaction_submitted", { transaction: txRef, payer: from });
+    }
+
+    async function paymentIncluded(provider, receipt, txRef, from) {
+      requireValue(lower(transaction) === lower(txRef) && lower(payer) === lower(from), "submitted transaction identity changed");
+      while ((await provider.getBlockNumber()) - receipt.blockNumber < confirmations) {
+        options.setStatus(
+          "Payment is on-chain.\nWaiting for " + confirmations + " newer block" +
+          (confirmations === 1 ? "" : "s") + " before finishing x402…\n" +
+          options.shortHex(txRef)
+        );
+        await new Promise(function (resolve) { globalThis.setTimeout(resolve, 1000); });
+      }
+      options.setStatus("Payment confirmed. Sign the x402 payment proof to finish.\n" + options.shortHex(txRef), "ok");
+      options.showProof();
+    }
+
+    async function signProof(ethereum) {
+      requireValue(paymentRequired && accepted && transaction && payer, "payment transaction is not ready for x402 proof");
+      requireValue(ethereum, "MetaMask is not connected.");
+      const accounts = await ethereum.request({ method: "eth_accounts" });
+      requireValue(accounts.length && lower(accounts[0]) === lower(payer), "selected MetaMask account does not match the transaction payer");
+      const payload = createPaymentPayload(paymentRequired, accepted, transaction, payer);
+      const typed = buildPaymentProofTypedData(payload, true);
+      options.setStatus("Confirm the x402 payment proof in MetaMask…\nThis binds your payment to this exact coffee request.");
+      payload.payload.signature = await ethereum.request({
+        method: "eth_signTypedData_v4", params: [payer, JSON.stringify(typed)],
+      });
+      const response = await fetch(resourceUrl, {
+        method: "GET", cache: "no-store", credentials: "omit",
+        headers: { "PAYMENT-SIGNATURE": encodeHeader(payload) },
+      });
+      const responseHeader = response.headers.get("PAYMENT-RESPONSE");
+      requireValue(response.status === 200 && responseHeader, "x402 server did not return HTTP 200 with PAYMENT-RESPONSE");
+      validatePaymentResponse(decodeHeader(responseHeader), transaction, payer);
+      options.setStatus("Paid. Coffee authorized.\n" + options.shortHex(transaction), "ok");
+      options.hideProof();
+    }
+
+    return {
+      enabled: Boolean(resourceUrl),
+      isVerified: function () { return Boolean(accepted); },
+      verify: verify,
+      transactionTerms: transactionTerms,
+      transactionSubmitted: transactionSubmitted,
+      paymentIncluded: paymentIncluded,
+      signProof: signProof,
+      resetPayment: function () { transaction = null; payer = null; },
+    };
+  }
+
   return {
     CONTRACT_METHOD: CONTRACT_METHOD,
     PROOF_TYPES: PROOF_TYPES,
@@ -190,5 +318,6 @@
     createPaymentPayload: createPaymentPayload,
     buildPaymentProofTypedData: buildPaymentProofTypedData,
     validatePaymentResponse: validatePaymentResponse,
+    createHumanWalletFlow: createHumanWalletFlow,
   };
 });
