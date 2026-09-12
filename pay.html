@@ -1,0 +1,458 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover">
+<meta name="cryptocoffee-public-pay-version" content="human-x402-public-v1">
+<title>CryptoCoffee — pay</title>
+<style>
+  :root {
+    --bg: #17130f; --panel: #1f1a15; --ink: #f3ede4; --ink-dim: #a89a89;
+    --copper: #e2924f; --success: #6fb98f; --warn: #d97757; --border: #332a20;
+  }
+  * { box-sizing: border-box; }
+  html {
+    overflow-x: hidden;
+    -webkit-text-size-adjust: 100%;
+    text-size-adjust: 100%;
+  }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font-family: -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    padding: 2rem 1.5rem; display: grid; gap: 1.2rem;
+    width: 100%; max-width: 480px; margin-inline: auto;
+    min-height: 100vh; align-content: start;
+    overflow-x: hidden; overflow-wrap: anywhere;
+  }
+  header {
+    display: grid;
+    gap: 0.55rem;
+    justify-items: center;
+    text-align: center;
+  }
+  h1 { font-size: 1.2rem; margin: 0; }
+  .brand-logo {
+    display: block;
+    width: min(9rem, 46vw);
+    height: auto;
+    aspect-ratio: 1;
+    object-fit: contain;
+  }
+  .amount { font-size: 1.6rem; color: var(--copper); font-weight: 600; }
+  .card {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
+    padding: 1.2rem 1.3rem; display: grid; gap: 0.6rem;
+    min-width: 0;
+  }
+  .row { display: flex; justify-content: space-between; font-size: 0.85rem; color: var(--ink-dim); gap: 1rem; min-width: 0; }
+  .row b { color: var(--ink); font-weight: 500; overflow-wrap: anywhere; word-break: break-word; text-align: right; min-width: 0; }
+  button {
+    font: inherit; font-size: 1rem; padding: 0.9rem 1rem; border-radius: 10px;
+    border: 1px solid var(--copper); background: transparent; color: var(--copper);
+    cursor: pointer; font-weight: 600; max-width: 100%;
+  }
+  button:disabled { opacity: 0.5; cursor: default; }
+  button.secondary { border-color: var(--success); color: var(--success); }
+  .verified { color: var(--success); font-weight: 600; }
+  button.link { display: block; text-align: center; text-decoration: none; }
+  #status {
+    font-size: 0.9rem; line-height: 1.5; white-space: pre-wrap;
+    overflow-wrap: anywhere; word-break: break-word; max-width: 100%;
+  }
+  #status.ok { color: var(--success); }
+  #status.err { color: var(--warn); }
+  a { color: var(--copper); }
+</style>
+</head>
+<body>
+  <header>
+    <img class="brand-logo" src="assets/bcc-logo.svg?v=2c6a1a6763635725" alt="UZH Blockchain Center" width="2126" height="2126">
+    <h1>CryptoCoffee — pay for your session</h1>
+  </header>
+  <div class="card">
+    <div class="row"><span>Amount</span><b id="amountDisplay">—</b></div>
+    <div class="row"><span>Network</span><b id="networkDisplay">—</b></div>
+    <div class="row"><span>Machine</span><b id="machineDisplay">—</b></div>
+    <div class="row"><span>Session</span><b id="sessionDisplay">—</b></div>
+    <div class="row" id="x402TermsRow" hidden><span>x402</span><b id="x402TermsDisplay">Checking payment terms…</b></div>
+  </div>
+
+  <div id="noWallet" class="card" hidden>
+    <p>No wallet detected in this browser. Open this page inside MetaMask's own
+       browser instead — tap below (this relaunches the same link inside MetaMask,
+       where it can actually submit the transaction):</p>
+    <a id="mmLink" class="link" href="#"><button>Open in MetaMask</button></a>
+  </div>
+
+  <button id="payBtn" hidden>Pay with MetaMask</button>
+  <button id="proofBtn" class="secondary" hidden>Sign x402 payment proof</button>
+  <div id="status"></div>
+
+<script src="vendor/ethers.umd.min.js?v=a66293a6a2bb4dee"></script>
+<script src="phone-x402.js?v=dec71abc7ccbde22"></script>
+<script>
+// Professor's pay page (merged/ui/www/pay.html): MetaMask Mobile drops a
+// custom 4-arg ethereum: URI, so this page builds payForSession via ethers
+// inside a wallet-injected browser. ABI is THIS repo's uint64 deadline,
+// not the professor contract's uint256.
+const params = new URLSearchParams(location.search);
+let CONTRACT = params.get("contract");
+let CHAIN_ID = parseInt(params.get("chainId"), 10);
+let SESSION_ID = params.get("sessionId");
+let MACHINE_ID = params.get("machineId");
+let AMOUNT = params.get("amount");
+let DEADLINE = params.get("deadline");
+let WALLET_RPC = params.get("rpc") || "";
+let CHAIN_NAME = params.get("chainName") || "UZH Ethereum PoS";
+let COIN_SYMBOL = params.get("symbol") || "UZHETHs";
+let MACHINE_LABEL = params.get("machineLabel") || "";
+const X402_RESOURCE = params.get("x402Resource") || "";
+const X402_NETWORK = params.get("x402Network") || "";
+const X402_VERSION = parseInt(params.get("x402Version") || "0", 10);
+const SESSION_LABEL = params.get("session") || "";
+const CONFIRMATIONS = parseInt(params.get("confirmations") || "0", 10);
+const MAXIMUM_AMOUNT = "20000000000000000";
+let PAYMENT_REQUIRED = null;
+let VERIFIED_REQUIREMENT = null;
+let HUMAN_TX = null;
+let HUMAN_PAYER = null;
+
+const ABI = ["function payForSession(bytes32 sessionId, bytes32 machineId, uint256 expectedAmount, uint64 deadline) external payable"];
+
+function fmtAmount(wei) {
+  try { return ethers.utils.formatEther(wei) + " " + COIN_SYMBOL; } catch { return wei + " wei"; }
+}
+
+function shortHex(v) {
+  if (!v) return "—";
+  v = String(v);
+  return v.length > 12 ? v.slice(0, 10) + "…" + v.slice(-4) : v;
+}
+
+function friendlyError(err) {
+  if (!err) return "Unknown error";
+  var reason = err.reason || (err.error && err.error.message);
+  if (reason && reason !== "execution reverted") return String(reason);
+  var msg = err.message ? String(err.message) : String(err);
+  var cut = msg.search(/\s*\[ See:/);
+  if (cut > 0) msg = msg.slice(0, cut).trim();
+  cut = msg.search(/\s*\(reason=/);
+  if (cut > 0) msg = msg.slice(0, cut).trim();
+  if (msg.length > 160) msg = msg.slice(0, 157) + "…";
+  return msg;
+}
+
+function renderInvoice() {
+  document.getElementById("amountDisplay").textContent = AMOUNT ? fmtAmount(AMOUNT) : "—";
+  document.getElementById("networkDisplay").textContent = invoiceReady() ? CHAIN_NAME : "—";
+  document.getElementById("machineDisplay").textContent = MACHINE_LABEL || shortHex(MACHINE_ID);
+  document.getElementById("sessionDisplay").textContent = shortHex(SESSION_ID);
+}
+
+const statusEl = document.getElementById("status");
+function setStatus(text, cls) {
+  statusEl.textContent = text;
+  statusEl.className = cls || "";
+}
+
+function invoiceReady() {
+  return CONTRACT && SESSION_ID && MACHINE_ID && AMOUNT && DEADLINE && CHAIN_ID;
+}
+
+function applyWalletConnect(wc) {
+  CONTRACT = wc.contract;
+  CHAIN_ID = parseInt(wc.chain_id, 10);
+  SESSION_ID = wc.session_id_hex;
+  MACHINE_ID = wc.machine_id_hex;
+  MACHINE_LABEL = wc.machine_id || "";
+  AMOUNT = String(wc.amount);
+  DEADLINE = String(wc.deadline);
+  WALLET_RPC = wc.wallet_rpc_url || WALLET_RPC;
+  if (wc.chain_name) CHAIN_NAME = wc.chain_name;
+  if (wc.native_symbol) COIN_SYMBOL = wc.native_symbol;
+}
+
+function parseEip681(uri) {
+  if (!uri || uri.indexOf("ethereum:") !== 0) return false;
+  var addr = uri.split(":")[1].split("@")[0];
+  var chainId = parseInt(uri.split("@")[1].split("/")[0], 10);
+  var qs = uri.slice(uri.indexOf("?") + 1).split("&");
+  var b32 = [], out = {};
+  qs.forEach(function (kv) {
+    var i = kv.indexOf("="), k = kv.slice(0, i), v = kv.slice(i + 1);
+    if (k === "bytes32") b32.push(v); else out[k] = v;
+  });
+  if (b32.length < 2 || !out.uint256 || !out.uint64) return false;
+  CONTRACT = addr;
+  CHAIN_ID = chainId;
+  SESSION_ID = b32[0];
+  MACHINE_ID = b32[1];
+  AMOUNT = out.value || out.uint256;
+  DEADLINE = out.uint64;
+  return true;
+}
+
+function showPayOrWalletPrompt() {
+  renderInvoice();
+  if (!invoiceReady()) {
+    setStatus("Waiting for an invoice on the kiosk — tap a drink there, then come back.", "err");
+    return;
+  }
+  if (!window.ethereum) {
+    document.getElementById("noWallet").hidden = false;
+    document.getElementById("payBtn").hidden = true;
+    const deepLink = "https://metamask.app.link/dapp/" + location.host + location.pathname + location.search;
+    document.getElementById("mmLink").href = deepLink;
+    setStatus("");
+  } else {
+    document.getElementById("noWallet").hidden = true;
+    document.getElementById("payBtn").hidden = false;
+    document.getElementById("payBtn").disabled = !!X402_RESOURCE && !VERIFIED_REQUIREMENT;
+    if (!X402_RESOURCE) setStatus("");
+  }
+}
+
+function x402Expected() {
+  return {
+    resourceUrl: X402_RESOURCE,
+    network: X402_NETWORK,
+    chainId: CHAIN_ID,
+    amount: String(AMOUNT),
+    maximumAmount: MAXIMUM_AMOUNT,
+    registry: CONTRACT,
+    sessionId: SESSION_LABEL,
+    sessionIdBytes32: SESSION_ID,
+    machineId: MACHINE_LABEL,
+    machineIdBytes32: MACHINE_ID,
+    deadline: DEADLINE,
+    confirmations: CONFIRMATIONS,
+  };
+}
+
+async function reportPhoneEvent(event, details) {
+  if (!X402_RESOURCE) return false;
+  const controller = new AbortController();
+  const timer = globalThis.setTimeout(function () { controller.abort(); }, 1500);
+  try {
+    const endpoint = new URL("/x402/client-event/" + encodeURIComponent(SESSION_LABEL), X402_RESOURCE);
+    const response = await fetch(endpoint.toString(), {
+      method: "POST",
+      cache: "no-store",
+      credentials: "omit",
+      signal: controller.signal,
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(Object.assign({ event: event }, details || {})),
+    });
+    return response.ok;
+  } catch (_) {
+    // The supervisor sidecar is observational. It cannot decide whether a
+    // cryptographically valid payment may proceed.
+    return false;
+  } finally {
+    globalThis.clearTimeout(timer);
+  }
+}
+
+async function verifyX402Offer() {
+  if (!X402_RESOURCE) return true; // Benjamin's unchanged production pay.html path.
+  if (X402_VERSION !== 2 || !SESSION_LABEL || !MACHINE_LABEL || ![1, 2].includes(CONFIRMATIONS)) {
+    throw new Error("incomplete human-wallet x402 invoice");
+  }
+  document.getElementById("x402TermsRow").hidden = false;
+  setStatus("Reading the x402 payment request…");
+  const response = await fetch(X402_RESOURCE, { method: "GET", cache: "no-store", credentials: "omit" });
+  const header = response.headers.get("PAYMENT-REQUIRED");
+  if (response.status !== 402 || !header) throw new Error("server did not return HTTP 402 with PAYMENT-REQUIRED");
+  const required = CryptoCoffeePhoneX402.decodeHeader(header);
+  const accepted = CryptoCoffeePhoneX402.validatePaymentRequired(required, x402Expected());
+  PAYMENT_REQUIRED = required;
+  VERIFIED_REQUIREMENT = accepted;
+  const txTerms = CryptoCoffeePhoneX402.transactionFromRequirement(accepted);
+  CONTRACT = txTerms.contractAddress;
+  SESSION_ID = txTerms.sessionIdBytes32;
+  MACHINE_ID = txTerms.machineIdBytes32;
+  AMOUNT = txTerms.amount;
+  DEADLINE = txTerms.deadline;
+  document.getElementById("x402TermsDisplay").textContent = "Payment terms verified";
+  document.getElementById("x402TermsDisplay").className = "verified";
+  renderInvoice();
+  await reportPhoneEvent("terms_verified");
+  setStatus("x402 payment terms verified.\nTap Pay with MetaMask when you are ready.", "ok");
+  return true;
+}
+
+async function loadFromKiosk() {
+  if (invoiceReady()) return true;
+  try {
+    const r = await fetch("status.json?_=" + Date.now(), { cache: "no-store" });
+    const data = await r.json();
+    if (data.status !== "awaiting_payment") return false;
+    if (data.wallet_connect) applyWalletConnect(data.wallet_connect);
+    else if (data.payment_uri) parseEip681(data.payment_uri);
+    return invoiceReady();
+  } catch (e) {
+    return false;
+  }
+}
+
+async function ensureChain(provider) {
+  const network = await provider.getNetwork();
+  if (network.chainId === CHAIN_ID) return;
+  const hexChainId = "0x" + CHAIN_ID.toString(16);
+  try {
+    await window.ethereum.request({ method: "wallet_switchEthereumChain", params: [{ chainId: hexChainId }] });
+  } catch (switchErr) {
+    if (switchErr.code === 4902 && WALLET_RPC) {
+      await window.ethereum.request({
+        method: "wallet_addEthereumChain",
+        params: [{
+          chainId: hexChainId,
+          chainName: CHAIN_NAME,
+          rpcUrls: [WALLET_RPC],
+          nativeCurrency: { name: COIN_SYMBOL, symbol: COIN_SYMBOL, decimals: 18 },
+        }],
+      });
+    } else {
+      throw switchErr;
+    }
+  }
+}
+
+async function pay() {
+  const payBtn = document.getElementById("payBtn");
+  payBtn.disabled = true;
+  try {
+    if (!invoiceReady()) {
+      await loadFromKiosk();
+    }
+    if (!invoiceReady()) {
+      setStatus("No live invoice — tap a drink on the kiosk first.", "err");
+      payBtn.disabled = false;
+      return;
+    }
+    if (X402_RESOURCE && !VERIFIED_REQUIREMENT) throw new Error("x402 payment terms are not verified");
+    if (HUMAN_TX) throw new Error("this page already submitted its one payment");
+    setStatus("Connecting wallet...");
+    const provider = new ethers.providers.Web3Provider(window.ethereum, "any");
+    await provider.send("eth_requestAccounts", []);
+    await ensureChain(provider);
+    const signer = provider.getSigner();
+    const payer = await signer.getAddress();
+    const txTerms = X402_RESOURCE
+      ? CryptoCoffeePhoneX402.transactionFromRequirement(VERIFIED_REQUIREMENT)
+      : { contractAddress: CONTRACT, sessionIdBytes32: SESSION_ID, machineIdBytes32: MACHINE_ID, amount: String(AMOUNT), deadline: String(DEADLINE), value: String(AMOUNT) };
+    const contract = new ethers.Contract(txTerms.contractAddress, ABI, signer);
+
+    setStatus("Confirm the transaction in your wallet...");
+    const tx = await contract.payForSession(
+      txTerms.sessionIdBytes32,
+      txTerms.machineIdBytes32,
+      txTerms.amount,
+      txTerms.deadline,
+      { value: txTerms.value }
+    );
+    HUMAN_TX = tx.hash;
+    HUMAN_PAYER = payer;
+    try {
+      await reportPhoneEvent("transaction_submitted", { transaction: tx.hash, payer: payer });
+    } catch (_) {
+      // Presentation telemetry cannot invalidate a transaction already accepted by MetaMask.
+    }
+    setStatus("Submitted " + shortHex(tx.hash) + "\nWaiting for the payment to be included…");
+
+    const receipt = await tx.wait();
+    if (receipt.status === 1) {
+      while ((await provider.getBlockNumber()) - receipt.blockNumber < CONFIRMATIONS) {
+        setStatus(
+          "Payment is on-chain.\nWaiting for " + CONFIRMATIONS + " newer block" + (CONFIRMATIONS === 1 ? "" : "s") + " before finishing x402…\n" + shortHex(tx.hash)
+        );
+        await new Promise(function (resolve) { setTimeout(resolve, 1000); });
+      }
+      if (X402_RESOURCE) {
+        setStatus("Payment confirmed. Sign the x402 payment proof to finish.\n" + shortHex(tx.hash), "ok");
+        document.getElementById("proofBtn").hidden = false;
+      } else {
+        setStatus("Paid. Go back to the kiosk.\n" + shortHex(tx.hash), "ok");
+      }
+    } else {
+      setStatus("Transaction reverted on-chain: " + shortHex(tx.hash), "err");
+      HUMAN_TX = null;
+      HUMAN_PAYER = null;
+      payBtn.disabled = false;
+    }
+  } catch (err) {
+    setStatus("Error: " + friendlyError(err), "err");
+    payBtn.disabled = !!HUMAN_TX;
+  }
+}
+
+async function signX402Proof() {
+  const proofBtn = document.getElementById("proofBtn");
+  proofBtn.disabled = true;
+  try {
+    if (!PAYMENT_REQUIRED || !VERIFIED_REQUIREMENT || !HUMAN_TX || !HUMAN_PAYER) {
+      throw new Error("payment transaction is not ready for x402 proof");
+    }
+    const accounts = await window.ethereum.request({ method: "eth_accounts" });
+    if (!accounts.length || accounts[0].toLowerCase() !== HUMAN_PAYER.toLowerCase()) {
+      throw new Error("selected MetaMask account does not match the transaction payer");
+    }
+    const payload = CryptoCoffeePhoneX402.createPaymentPayload(
+      PAYMENT_REQUIRED, VERIFIED_REQUIREMENT, HUMAN_TX, HUMAN_PAYER
+    );
+    const typed = CryptoCoffeePhoneX402.buildPaymentProofTypedData(payload, true);
+    setStatus("Confirm the x402 payment proof in MetaMask…\nThis binds your payment to this exact coffee request.");
+    payload.payload.signature = await window.ethereum.request({
+      method: "eth_signTypedData_v4",
+      params: [HUMAN_PAYER, JSON.stringify(typed)],
+    });
+    const response = await fetch(X402_RESOURCE, {
+      method: "GET",
+      cache: "no-store",
+      credentials: "omit",
+      headers: { "PAYMENT-SIGNATURE": CryptoCoffeePhoneX402.encodeHeader(payload) },
+    });
+    const responseHeader = response.headers.get("PAYMENT-RESPONSE");
+    if (response.status !== 200 || !responseHeader) {
+      throw new Error("x402 server did not return HTTP 200 with PAYMENT-RESPONSE");
+    }
+    const decoded = CryptoCoffeePhoneX402.decodeHeader(responseHeader);
+    CryptoCoffeePhoneX402.validatePaymentResponse(decoded, HUMAN_TX, HUMAN_PAYER);
+    setStatus("Paid. Coffee authorized.\n" + shortHex(HUMAN_TX), "ok");
+    proofBtn.hidden = true;
+  } catch (err) {
+    setStatus("Error: " + friendlyError(err), "err");
+    proofBtn.disabled = false;
+  }
+}
+
+document.getElementById("payBtn").addEventListener("click", pay);
+document.getElementById("proofBtn").addEventListener("click", signX402Proof);
+
+(async function init() {
+  if (!invoiceReady()) {
+    setStatus("Looking up the kiosk invoice…");
+    await loadFromKiosk();
+  }
+  if (invoiceReady() && X402_RESOURCE) {
+    try {
+      await reportPhoneEvent("phone_page_opened");
+      await verifyX402Offer();
+    } catch (err) {
+      VERIFIED_REQUIREMENT = null;
+      document.getElementById("x402TermsRow").hidden = false;
+      document.getElementById("x402TermsDisplay").textContent = "Payment disabled";
+      setStatus("Payment disabled: " + friendlyError(err), "err");
+    }
+  }
+  showPayOrWalletPrompt();
+  if (!invoiceReady()) {
+    setInterval(async function () {
+      if (invoiceReady()) return;
+      if (await loadFromKiosk()) showPayOrWalletPrompt();
+    }, 700);
+  }
+})();
+</script>
+</body>
+</html>
