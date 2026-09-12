@@ -51,9 +51,10 @@
     border: 1px solid var(--copper); background: transparent; color: var(--copper);
     cursor: pointer; font-weight: 600; max-width: 100%;
   }
+  button.primary {
+    background: var(--copper); border-color: var(--copper); color: #17130f;
+  }
   button:disabled { opacity: 0.5; cursor: default; }
-  button.secondary { border-color: var(--success); color: var(--success); }
-  .verified { color: var(--success); font-weight: 600; }
   button.link { display: block; text-align: center; text-decoration: none; }
   #status {
     font-size: 0.9rem; line-height: 1.5; white-space: pre-wrap;
@@ -62,6 +63,7 @@
   #status.ok { color: var(--success); }
   #status.err { color: var(--warn); }
   a { color: var(--copper); }
+  [hidden] { display: none !important; }
 </style>
 </head>
 <body>
@@ -74,18 +76,16 @@
     <div class="row"><span>Network</span><b id="networkDisplay">—</b></div>
     <div class="row"><span>Machine</span><b id="machineDisplay">—</b></div>
     <div class="row"><span>Session</span><b id="sessionDisplay">—</b></div>
-    <div class="row" id="x402TermsRow" hidden><span>x402</span><b id="x402TermsDisplay">Checking payment terms…</b></div>
+    <div class="row" id="x402TermsRow" hidden><span>x402</span><b id="x402TermsDisplay">Checking payment terms...</b></div>
   </div>
+
+  <button id="payBtn" class="primary" type="button" hidden>Pay with MetaMask</button>
+  <button id="proofBtn" class="primary" type="button" hidden>Sign x402 payment proof</button>
 
   <div id="noWallet" class="card" hidden>
-    <p>No wallet detected in this browser. Open this page inside MetaMask's own
-       browser instead — tap below (this relaunches the same link inside MetaMask,
-       where it can actually submit the transaction):</p>
-    <a id="mmLink" class="link" href="#"><button>Open in MetaMask</button></a>
+    <p>MetaMask is not in this browser. Install the extension, or open this page in MetaMask’s in-app browser:</p>
+    <a id="mmLink" class="link" href="#"><button type="button">Open in MetaMask</button></a>
   </div>
-
-  <button id="payBtn" hidden>Pay with MetaMask</button>
-  <button id="proofBtn" class="secondary" hidden>Sign x402 payment proof</button>
   <div id="status"></div>
 
 <script src="vendor/ethers.umd.min.js?v=a66293a6a2bb4dee"></script>
@@ -192,24 +192,112 @@ function parseEip681(uri) {
   return true;
 }
 
+// Benjamin's public page accommodates MetaMask Mobile injecting its provider
+// after page load. x402 deliberately reuses that wallet-discovery behavior.
+let ETH = null;
+
+function looksLikeMetaMaskBrowser() {
+  try { return /MetaMask/i.test(navigator.userAgent || ""); } catch (e) { return false; }
+}
+
+function injectedProvider() {
+  if (ETH) return ETH;
+  var eth = window.ethereum;
+  if (!eth) return null;
+  if (eth.providers && eth.providers.length) {
+    for (var i = 0; i < eth.providers.length; i++) {
+      if (eth.providers[i] && eth.providers[i].isMetaMask) return eth.providers[i];
+    }
+    return eth.providers[0];
+  }
+  return eth;
+}
+
+function rememberProvider(p) {
+  if (p) ETH = p;
+}
+
 function showPayOrWalletPrompt() {
   renderInvoice();
+  var payBtn = document.getElementById("payBtn");
+  var noWallet = document.getElementById("noWallet");
+  var deepLink = "https://metamask.app.link/dapp/" + location.host + location.pathname + location.search;
+  document.getElementById("mmLink").href = deepLink;
   if (!invoiceReady()) {
+    payBtn.hidden = true;
+    noWallet.hidden = true;
     setStatus("Waiting for an invoice on the kiosk — tap a drink there, then come back.", "err");
     return;
   }
-  if (!window.ethereum) {
-    document.getElementById("noWallet").hidden = false;
-    document.getElementById("payBtn").hidden = true;
-    const deepLink = "https://metamask.app.link/dapp/" + location.host + location.pathname + location.search;
-    document.getElementById("mmLink").href = deepLink;
-    setStatus("");
+  var eth = injectedProvider();
+  if (eth) rememberProvider(eth);
+  payBtn.hidden = false;
+  payBtn.textContent = "Pay with MetaMask";
+  payBtn.disabled = !!X402_RESOURCE && !VERIFIED_REQUIREMENT;
+  if (eth || looksLikeMetaMaskBrowser()) {
+    noWallet.hidden = true;
+    if (!X402_RESOURCE) {
+      setStatus(eth ? "MetaMask is ready. Tap Pay and confirm in the extension." : "Connecting to MetaMask…", "ok");
+    }
   } else {
-    document.getElementById("noWallet").hidden = true;
-    document.getElementById("payBtn").hidden = false;
-    document.getElementById("payBtn").disabled = !!X402_RESOURCE && !VERIFIED_REQUIREMENT;
-    if (!X402_RESOURCE) setStatus("");
+    noWallet.hidden = false;
+    if (!X402_RESOURCE) setStatus("No wallet yet — tap Pay anyway if MetaMask is installed, or open it below.");
   }
+}
+
+function watchForWallet() {
+  function onFound(p) {
+    var provider = p && p.request ? p : (p && p.detail && p.detail.provider) || injectedProvider();
+    rememberProvider(provider);
+    showPayOrWalletPrompt();
+  }
+  window.addEventListener("ethereum#initialized", function () { onFound(window.ethereum); }, { once: true });
+  window.addEventListener("eip6963:announceProvider", function (event) {
+    var d = event.detail || {};
+    var info = d.info || {};
+    var provider = d.provider;
+    if (provider && (info.rdns === "io.metamask" || /metamask/i.test(info.name || "") || provider.isMetaMask)) {
+      onFound(provider);
+    } else if (provider && !ETH) {
+      onFound(provider);
+    }
+  });
+  try { window.dispatchEvent(new Event("eip6963:requestProvider")); } catch (e) {}
+  if (injectedProvider()) {
+    onFound(injectedProvider());
+    return;
+  }
+  var n = 0;
+  var t = setInterval(function () {
+    n += 1;
+    if (injectedProvider()) {
+      clearInterval(t);
+      onFound(injectedProvider());
+    } else if (n >= 50) {
+      clearInterval(t);
+    }
+  }, 200);
+}
+
+function waitForProvider(ms) {
+  var already = injectedProvider();
+  if (already) return Promise.resolve(already);
+  return new Promise(function (resolve) {
+    var done = false;
+    function finish() {
+      if (done) return;
+      done = true;
+      resolve(injectedProvider());
+    }
+    window.addEventListener("ethereum#initialized", finish, { once: true });
+    var started = Date.now();
+    var t = setInterval(function () {
+      if (injectedProvider() || Date.now() - started >= ms) {
+        clearInterval(t);
+        finish();
+      }
+    }, 100);
+  });
 }
 
 function x402Expected() {
@@ -274,7 +362,6 @@ async function verifyX402Offer() {
   AMOUNT = txTerms.amount;
   DEADLINE = txTerms.deadline;
   document.getElementById("x402TermsDisplay").textContent = "Payment terms verified";
-  document.getElementById("x402TermsDisplay").className = "verified";
   renderInvoice();
   await reportPhoneEvent("terms_verified");
   setStatus("x402 payment terms verified.\nTap Pay with MetaMask when you are ready.", "ok");
@@ -299,11 +386,13 @@ async function ensureChain(provider) {
   const network = await provider.getNetwork();
   if (network.chainId === CHAIN_ID) return;
   const hexChainId = "0x" + CHAIN_ID.toString(16);
+  var eth = injectedProvider();
+  if (!eth) throw new Error("MetaMask is not connected.");
   try {
-    await window.ethereum.request({ method: "wallet_switchEthereumChain", params: [{ chainId: hexChainId }] });
+    await eth.request({ method: "wallet_switchEthereumChain", params: [{ chainId: hexChainId }] });
   } catch (switchErr) {
     if (switchErr.code === 4902 && WALLET_RPC) {
-      await window.ethereum.request({
+      await eth.request({
         method: "wallet_addEthereumChain",
         params: [{
           chainId: hexChainId,
@@ -333,7 +422,14 @@ async function pay() {
     if (X402_RESOURCE && !VERIFIED_REQUIREMENT) throw new Error("x402 payment terms are not verified");
     if (HUMAN_TX) throw new Error("this page already submitted its one payment");
     setStatus("Connecting wallet...");
-    const provider = new ethers.providers.Web3Provider(window.ethereum, "any");
+    var eth = injectedProvider() || await waitForProvider(8000);
+    if (!eth) {
+      setStatus("MetaMask did not connect. Reload this page inside MetaMask.", "err");
+      payBtn.disabled = false;
+      return;
+    }
+    rememberProvider(eth);
+    const provider = new ethers.providers.Web3Provider(eth, "any");
     await provider.send("eth_requestAccounts", []);
     await ensureChain(provider);
     const signer = provider.getSigner();
@@ -393,7 +489,9 @@ async function signX402Proof() {
     if (!PAYMENT_REQUIRED || !VERIFIED_REQUIREMENT || !HUMAN_TX || !HUMAN_PAYER) {
       throw new Error("payment transaction is not ready for x402 proof");
     }
-    const accounts = await window.ethereum.request({ method: "eth_accounts" });
+    var eth = injectedProvider();
+    if (!eth) throw new Error("MetaMask is not connected.");
+    const accounts = await eth.request({ method: "eth_accounts" });
     if (!accounts.length || accounts[0].toLowerCase() !== HUMAN_PAYER.toLowerCase()) {
       throw new Error("selected MetaMask account does not match the transaction payer");
     }
@@ -402,7 +500,7 @@ async function signX402Proof() {
     );
     const typed = CryptoCoffeePhoneX402.buildPaymentProofTypedData(payload, true);
     setStatus("Confirm the x402 payment proof in MetaMask…\nThis binds your payment to this exact coffee request.");
-    payload.payload.signature = await window.ethereum.request({
+    payload.payload.signature = await eth.request({
       method: "eth_signTypedData_v4",
       params: [HUMAN_PAYER, JSON.stringify(typed)],
     });
@@ -446,6 +544,7 @@ document.getElementById("proofBtn").addEventListener("click", signX402Proof);
     }
   }
   showPayOrWalletPrompt();
+  watchForWallet();
   if (!invoiceReady()) {
     setInterval(async function () {
       if (invoiceReady()) return;
