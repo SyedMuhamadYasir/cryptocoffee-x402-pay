@@ -11,6 +11,7 @@
     "contractMethod", "confirmations", "proofMode",
   ];
   const CONTRACT_METHOD = "payForSession(bytes32,bytes32,uint256,uint64)";
+  const PROTECTED_FETCH_TIMEOUT_MS = 30000;
 
   function requireValue(condition, message) {
     if (!condition) throw new Error(message);
@@ -30,6 +31,16 @@
 
   function errorName(error) {
     return String((error && error.name) || "Error").slice(0, 80);
+  }
+
+  async function protectedFetch(url, init, timeoutMs) {
+    const controller = new AbortController();
+    const timer = globalThis.setTimeout(function () { controller.abort(); }, timeoutMs);
+    try {
+      return await fetch(url, Object.assign({}, init, { signal: controller.signal }));
+    } finally {
+      globalThis.clearTimeout(timer);
+    }
   }
 
   function decodeHeader(value) {
@@ -120,6 +131,7 @@
     let accepted = null;
     let transaction = null;
     let payer = null;
+    const protectedFetchTimeoutMs = Number(options.protectedFetchTimeoutMs || PROTECTED_FETCH_TIMEOUT_MS);
 
     function expected() {
       const invoice = options.getInvoice();
@@ -164,7 +176,20 @@
       options.showTerms("Checking payment terms...");
       options.setStatus("Reading the x402 payment request…");
       await report("phone_page_opened");
-      const response = await fetch(resourceUrl, { method: "GET", cache: "no-store", credentials: "omit" });
+      let response;
+      try {
+        response = await protectedFetch(
+          resourceUrl,
+          { method: "GET", cache: "no-store", credentials: "omit" },
+          protectedFetchTimeoutMs,
+        );
+      } catch (error) {
+        throw stagedError(
+          "payment_required_fetch",
+          "The x402 payment request could not be loaded. Check the connection and try again.",
+          error,
+        );
+      }
       const header = response.headers.get("PAYMENT-REQUIRED");
       requireValue(response.status === 402 && header, "server did not return HTTP 402 with PAYMENT-REQUIRED");
       paymentRequired = decodeHeader(header);
@@ -209,10 +234,14 @@
       await report("transaction_reference_retry_started", { transaction: transaction });
       let response;
       try {
-        response = await fetch(resourceUrl, {
-          method: "GET", cache: "no-store", credentials: "omit",
-          headers: { "PAYMENT-SIGNATURE": encodeHeader(payload) },
-        });
+        response = await protectedFetch(
+          resourceUrl,
+          {
+            method: "GET", cache: "no-store", credentials: "omit",
+            headers: { "PAYMENT-SIGNATURE": encodeHeader(payload) },
+          },
+          protectedFetchTimeoutMs,
+        );
         await report("transaction_reference_retry_fetch_succeeded", { success: true });
       } catch (error) {
         await report("transaction_reference_retry_fetch_failed", {
@@ -268,6 +297,7 @@
 
   return {
     CONTRACT_METHOD: CONTRACT_METHOD,
+    PROTECTED_FETCH_TIMEOUT_MS: PROTECTED_FETCH_TIMEOUT_MS,
     decodeHeader: decodeHeader,
     encodeHeader: encodeHeader,
     validatePaymentRequired: validatePaymentRequired,
