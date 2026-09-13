@@ -79,8 +79,8 @@
     <div class="row" id="x402TermsRow" hidden><span>x402</span><b id="x402TermsDisplay">Checking payment terms...</b></div>
   </div>
 
-  <button id="payBtn" class="primary" type="button" hidden>Pay with MetaMask</button>
-  <button id="proofBtn" class="primary" type="button" hidden>Sign x402 payment proof</button>
+  <button id="payBtn" class="primary" type="button" hidden>Pay 0.010 UZHETH with MetaMask</button>
+  <button id="retryX402Btn" class="primary" type="button" hidden>Retry finishing x402</button>
 
   <div id="noWallet" class="card" hidden>
     <p>MetaMask is not in this browser. Install the extension, or open this page in MetaMask’s in-app browser:</p>
@@ -89,7 +89,7 @@
   <div id="status"></div>
 
 <script src="vendor/ethers.umd.min.js?v=a66293a6a2bb4dee"></script>
-<script src="phone-x402.js?v=91af0127d0b207aa"></script>
+<script src="phone-x402.js?v=7eae670ca9f3556d"></script>
 <script>
 // Professor's pay page (merged/ui/www/pay.html): MetaMask Mobile drops a
 // custom 4-arg ethereum: URI, so this page builds payForSession via ethers
@@ -223,7 +223,7 @@ function showPayOrWalletPrompt() {
   var eth = injectedProvider();
   if (eth) rememberProvider(eth);
   payBtn.hidden = false;
-  payBtn.textContent = "Pay with MetaMask";
+  payBtn.textContent = X402_FLOW.enabled ? "Pay 0.010 UZHETH with MetaMask" : "Pay with MetaMask";
   payBtn.disabled = X402_FLOW.enabled && !X402_FLOW.isVerified();
   if (eth || looksLikeMetaMaskBrowser()) {
     noWallet.hidden = true;
@@ -348,11 +348,8 @@ const X402_FLOW = CryptoCoffeePhoneX402.createHumanWalletFlow({
     document.getElementById("x402TermsRow").hidden = false;
     document.getElementById("x402TermsDisplay").textContent = text;
   },
-  showProof: function () {
-    document.getElementById("payBtn").hidden = true;
-    document.getElementById("proofBtn").hidden = false;
-  },
-  hideProof: function () { document.getElementById("proofBtn").hidden = true; },
+  showRetry: function () { document.getElementById("retryX402Btn").hidden = false; },
+  hideRetry: function () { document.getElementById("retryX402Btn").hidden = true; },
   setStatus: setStatus,
   shortHex: shortHex,
 });
@@ -419,23 +416,25 @@ async function pay() {
   } catch (err) {
     setStatus("Error: " + friendlyError(err), "err");
     payBtn.disabled = !!HUMAN_TX;
+    if (HUMAN_TX && X402_FLOW.enabled) document.getElementById("retryX402Btn").hidden = false;
   }
 }
 
-async function signX402Proof() {
-  const proofBtn = document.getElementById("proofBtn");
-  proofBtn.disabled = true;
+async function retryX402Completion() {
+  const retryBtn = document.getElementById("retryX402Btn");
+  retryBtn.disabled = true;
   try {
-    await X402_FLOW.signProof(injectedProvider());
+    setStatus("Payment confirmed. Finishing x402…", "ok");
+    await X402_FLOW.finishPayment();
   } catch (err) {
-    var stage = err && err.proofStage ? " at " + err.proofStage.replace(/_/g, " ") : "";
-    setStatus("x402 proof stopped" + stage + ": " + (err.userMessage || friendlyError(err)), "err");
-    proofBtn.disabled = false;
+    var stage = err && err.x402Stage ? " at " + err.x402Stage.replace(/_/g, " ") : "";
+    setStatus("x402 completion stopped" + stage + ": " + (err.userMessage || friendlyError(err)), "err");
+    retryBtn.disabled = false;
   }
 }
 
 document.getElementById("payBtn").addEventListener("click", pay);
-document.getElementById("proofBtn").addEventListener("click", signX402Proof);
+document.getElementById("retryX402Btn").addEventListener("click", retryX402Completion);
 
 (async function init() {
   if (!invoiceReady()) {

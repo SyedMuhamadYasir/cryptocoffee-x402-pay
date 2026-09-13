@@ -10,8 +10,9 @@ Visual and wallet-interaction reference:
 <https://benckj.github.io/cryptocoffee-pay/pay.html>.
 
 The page contains no private keys, operator credentials, environment files,
-gateway code, machine code, runtime databases, or logs. Payment and the x402
-proof each require a separate, explicit approval in MetaMask.
+gateway code, machine code, runtime databases, or logs. The only MetaMask
+approval is the native payment transaction; after confirmation, its hash is
+used automatically as the scheme-specific x402 payment proof.
 
 The private implementation and controlled demo launcher live in
 `SyedMuhamadYasir/cryptocoffee-x402`.

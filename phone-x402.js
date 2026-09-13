@@ -8,7 +8,7 @@
   const EXTRA_KEYS = [
     "assetTransferMethod", "paymentFlow", "sessionId", "sessionIdBytes32",
     "machineId", "machineIdBytes32", "deadline", "contractAddress",
-    "contractMethod", "confirmations",
+    "contractMethod", "confirmations", "proofMode",
   ];
   const CONTRACT_METHOD = "payForSession(bytes32,bytes32,uint256,uint64)";
 
@@ -22,7 +22,7 @@
 
   function stagedError(stage, userMessage, cause) {
     const error = new Error(userMessage);
-    error.proofStage = stage;
+    error.x402Stage = stage;
     error.userMessage = userMessage;
     error.cause = cause;
     return error;
@@ -30,14 +30,6 @@
 
   function errorName(error) {
     return String((error && error.name) || "Error").slice(0, 80);
-  }
-
-  async function signatureHash(signature) {
-    const bytes = new TextEncoder().encode(String(signature));
-    const digest = await globalThis.crypto.subtle.digest("SHA-256", bytes);
-    return "sha256:" + Array.from(new Uint8Array(digest), function (byte) {
-      return byte.toString(16).padStart(2, "0");
-    }).join("");
   }
 
   function decodeHeader(value) {
@@ -72,6 +64,7 @@
     requireValue(lower(accepted.payTo) === lower(expected.registry), "registry/payTo mismatch");
     requireValue(extra.assetTransferMethod === "txid", "asset transfer method mismatch");
     requireValue(extra.paymentFlow === "upfront", "payment flow mismatch");
+    requireValue(extra.proofMode === "transaction-as-proof", "proof mode mismatch");
     requireValue(extra.sessionId === expected.sessionId, "session mismatch");
     requireValue(lower(extra.sessionIdBytes32) === lower(expected.sessionIdBytes32), "session bytes32 mismatch");
     requireValue(extra.machineId === expected.machineId, "machine mismatch");
@@ -96,100 +89,15 @@
     };
   }
 
-  function createPaymentPayload(paymentRequired, accepted, txRef, payer) {
+  function createPaymentPayload(paymentRequired, accepted, txRef) {
     return {
       x402Version: 2,
       payload: {
-        type: "payment-proof",
-        alg: "ES256K",
-        format: "eip712",
+        type: "transaction-reference",
         txRef: txRef,
-        from: payer,
-        signature: "0x",
       },
       accepted: accepted,
       resource: paymentRequired.resource,
-    };
-  }
-
-  const PROOF_TYPES = {
-    Resource: [
-      { name: "url", type: "string" },
-      { name: "description", type: "string" },
-      { name: "mimeType", type: "string" },
-    ],
-    Accepted: [
-      { name: "scheme", type: "string" },
-      { name: "assetTransferMethod", type: "string" },
-      { name: "paymentFlow", type: "string" },
-      { name: "network", type: "string" },
-      { name: "amount", type: "string" },
-      { name: "asset", type: "string" },
-      { name: "payTo", type: "address" },
-      { name: "maxTimeoutSeconds", type: "uint256" },
-      { name: "sessionId", type: "string" },
-      { name: "sessionIdBytes32", type: "bytes32" },
-      { name: "machineId", type: "string" },
-      { name: "machineIdBytes32", type: "bytes32" },
-      { name: "deadline", type: "uint64" },
-      { name: "contractAddress", type: "address" },
-      { name: "contractMethod", type: "string" },
-      { name: "confirmations", type: "uint256" },
-    ],
-    PaymentProof: [
-      { name: "txRef", type: "string" },
-      { name: "from", type: "address" },
-      { name: "resource", type: "Resource" },
-      { name: "accepted", type: "Accepted" },
-    ],
-  };
-
-  function buildPaymentProofTypedData(paymentPayload, includeDomainType) {
-    const accepted = paymentPayload.accepted;
-    const extra = accepted.extra;
-    const types = Object.assign({}, PROOF_TYPES);
-    if (includeDomainType) {
-      types.EIP712Domain = [
-        { name: "name", type: "string" },
-        { name: "version", type: "string" },
-        { name: "chainId", type: "uint256" },
-      ];
-    }
-    return {
-      types: types,
-      primaryType: "PaymentProof",
-      domain: {
-        name: "x402 Payment Proof",
-        version: "1",
-        chainId: Number(String(accepted.network).split(":")[1]),
-      },
-      message: {
-        txRef: paymentPayload.payload.txRef,
-        from: paymentPayload.payload.from,
-        resource: {
-          url: (paymentPayload.resource || {}).url || "",
-          description: (paymentPayload.resource || {}).description || "",
-          mimeType: (paymentPayload.resource || {}).mimeType || "",
-        },
-        accepted: {
-          scheme: accepted.scheme,
-          assetTransferMethod: extra.assetTransferMethod,
-          paymentFlow: extra.paymentFlow,
-          network: accepted.network,
-          amount: String(accepted.amount),
-          asset: accepted.asset,
-          payTo: accepted.payTo,
-          maxTimeoutSeconds: Number(accepted.maxTimeoutSeconds),
-          sessionId: extra.sessionId,
-          sessionIdBytes32: extra.sessionIdBytes32,
-          machineId: extra.machineId,
-          machineIdBytes32: extra.machineIdBytes32,
-          deadline: Number(extra.deadline),
-          contractAddress: extra.contractAddress,
-          contractMethod: extra.contractMethod,
-          confirmations: Number(extra.confirmations),
-        },
-      },
     };
   }
 
@@ -290,106 +198,41 @@
         );
         await new Promise(function (resolve) { globalThis.setTimeout(resolve, 1000); });
       }
-      options.setStatus("Payment confirmed. Sign the x402 payment proof to finish.\n" + options.shortHex(txRef), "ok");
-      options.showProof();
+      options.setStatus("Payment confirmed. Finishing x402…\n" + options.shortHex(txRef), "ok");
+      return finishPayment();
     }
 
-    async function signProof(ethereum) {
-      requireValue(paymentRequired && accepted && transaction && payer, "payment transaction is not ready for x402 proof");
-      await report("proof_button_clicked", { transaction: transaction });
-      if (!ethereum) {
-        await report("proof_accounts_failed", {
-          success: false, error_stage: "wallet_provider", error_name: "ProviderUnavailable",
-        });
-        throw stagedError(
-          "wallet_provider",
-          "MetaMask is not connected. Open this page inside MetaMask and try again.",
-        );
-      }
-      let accounts;
-      try {
-        accounts = await ethereum.request({ method: "eth_accounts" });
-        const payerMatches = Boolean(accounts.length && lower(accounts[0]) === lower(payer));
-        await report("proof_accounts_succeeded", {
-          success: true, account_count: accounts.length, payer_matches: payerMatches,
-        });
-        if (!payerMatches) {
-          throw stagedError(
-            "wallet_account_check",
-            "The selected MetaMask account does not match the account that paid.",
-          );
-        }
-      } catch (error) {
-        if (error && error.proofStage) throw error;
-        await report("proof_accounts_failed", {
-          success: false, error_stage: "wallet_account_check", error_name: errorName(error),
-        });
-        throw stagedError(
-          "wallet_account_check",
-          "MetaMask could not confirm the account that made the payment.",
-          error,
-        );
-      }
-      const payload = createPaymentPayload(paymentRequired, accepted, transaction, payer);
-      const typed = buildPaymentProofTypedData(payload, true);
-      options.setStatus("Confirm the x402 payment proof in MetaMask…\nThis binds your payment to this exact coffee request.");
-      await report("proof_typed_data_requested", { transaction: transaction });
-      let signature;
-      let digest;
-      try {
-        signature = await ethereum.request({
-          method: "eth_signTypedData_v4", params: [payer, JSON.stringify(typed)],
-        });
-        requireValue(typeof signature === "string" && signature.length > 0, "MetaMask returned no proof signature");
-      } catch (error) {
-        await report("proof_signature_failed", {
-          success: false, signature_present: false,
-          error_stage: "typed_data_signature", error_name: errorName(error),
-        });
-        throw stagedError(
-          "typed_data_signature",
-          "MetaMask did not return the x402 payment proof signature.",
-          error,
-        );
-      }
-      try {
-        digest = await signatureHash(signature);
-      } catch (_) {
-        digest = null; // Presence remains observable if hashing is unavailable.
-      }
-      await report("proof_signature_returned", {
-        success: true, signature_present: true, signature_sha256: digest,
-      });
-      payload.payload.signature = signature;
-      await report("proof_retry_started", {
-        transaction: transaction, signature_present: true, signature_sha256: digest,
-      });
+    async function finishPayment() {
+      requireValue(paymentRequired && accepted && transaction && payer, "payment transaction is not ready for x402 completion");
+      const payload = createPaymentPayload(paymentRequired, accepted, transaction);
+      await report("transaction_as_proof_prepared", { transaction: transaction });
+      await report("transaction_reference_retry_started", { transaction: transaction });
       let response;
       try {
         response = await fetch(resourceUrl, {
           method: "GET", cache: "no-store", credentials: "omit",
           headers: { "PAYMENT-SIGNATURE": encodeHeader(payload) },
         });
-        await report("proof_retry_fetch_succeeded", { success: true });
+        await report("transaction_reference_retry_fetch_succeeded", { success: true });
       } catch (error) {
-        await report("proof_retry_fetch_failed", {
-          success: false, error_stage: "signed_retry_fetch", error_name: errorName(error),
+        await report("transaction_reference_retry_fetch_failed", {
+          success: false, error_stage: "transaction_reference_retry", error_name: errorName(error),
         });
         throw stagedError(
-          "signed_retry_fetch",
-          "The signed x402 request could not reach the coffee server. Check the connection and try again.",
+          "transaction_reference_retry",
+          "The payment is confirmed, but x402 could not finish. Check the connection and retry finishing x402.",
           error,
         );
       }
-      await report("proof_retry_http_received", { http_status: response.status });
+      await report("transaction_reference_retry_http_received", { http_status: response.status });
       const responseHeader = response.headers.get("PAYMENT-RESPONSE");
-      await report("proof_payment_response_checked", {
+      await report("transaction_reference_payment_response_checked", {
         http_status: response.status, payment_response_present: Boolean(responseHeader),
       });
       if (response.status !== 200) {
         throw stagedError(
-          "signed_retry_http",
-          "The coffee server rejected the signed x402 request (HTTP " + response.status + ").",
+          "transaction_reference_http",
+          "The coffee server rejected the x402 completion (HTTP " + response.status + ").",
         );
       }
       if (!responseHeader) {
@@ -408,7 +251,7 @@
         );
       }
       options.setStatus("Paid. Coffee authorized.\n" + options.shortHex(transaction), "ok");
-      options.hideProof();
+      options.hideRetry();
     }
 
     return {
@@ -418,20 +261,18 @@
       transactionTerms: transactionTerms,
       transactionSubmitted: transactionSubmitted,
       paymentIncluded: paymentIncluded,
-      signProof: signProof,
+      finishPayment: finishPayment,
       resetPayment: function () { transaction = null; payer = null; },
     };
   }
 
   return {
     CONTRACT_METHOD: CONTRACT_METHOD,
-    PROOF_TYPES: PROOF_TYPES,
     decodeHeader: decodeHeader,
     encodeHeader: encodeHeader,
     validatePaymentRequired: validatePaymentRequired,
     transactionFromRequirement: transactionFromRequirement,
     createPaymentPayload: createPaymentPayload,
-    buildPaymentProofTypedData: buildPaymentProofTypedData,
     validatePaymentResponse: validatePaymentResponse,
     createHumanWalletFlow: createHumanWalletFlow,
   };
