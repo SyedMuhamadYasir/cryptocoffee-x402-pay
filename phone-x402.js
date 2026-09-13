@@ -20,6 +20,26 @@
     return String(value || "").toLowerCase();
   }
 
+  function stagedError(stage, userMessage, cause) {
+    const error = new Error(userMessage);
+    error.proofStage = stage;
+    error.userMessage = userMessage;
+    error.cause = cause;
+    return error;
+  }
+
+  function errorName(error) {
+    return String((error && error.name) || "Error").slice(0, 80);
+  }
+
+  async function signatureHash(signature) {
+    const bytes = new TextEncoder().encode(String(signature));
+    const digest = await globalThis.crypto.subtle.digest("SHA-256", bytes);
+    return "sha256:" + Array.from(new Uint8Array(digest), function (byte) {
+      return byte.toString(16).padStart(2, "0");
+    }).join("");
+  }
+
   function decodeHeader(value) {
     requireValue(typeof value === "string" && value.length > 0, "missing x402 header");
     const binary = atob(value);
@@ -276,22 +296,117 @@
 
     async function signProof(ethereum) {
       requireValue(paymentRequired && accepted && transaction && payer, "payment transaction is not ready for x402 proof");
-      requireValue(ethereum, "MetaMask is not connected.");
-      const accounts = await ethereum.request({ method: "eth_accounts" });
-      requireValue(accounts.length && lower(accounts[0]) === lower(payer), "selected MetaMask account does not match the transaction payer");
+      await report("proof_button_clicked", { transaction: transaction });
+      if (!ethereum) {
+        await report("proof_accounts_failed", {
+          success: false, error_stage: "wallet_provider", error_name: "ProviderUnavailable",
+        });
+        throw stagedError(
+          "wallet_provider",
+          "MetaMask is not connected. Open this page inside MetaMask and try again.",
+        );
+      }
+      let accounts;
+      try {
+        accounts = await ethereum.request({ method: "eth_accounts" });
+        const payerMatches = Boolean(accounts.length && lower(accounts[0]) === lower(payer));
+        await report("proof_accounts_succeeded", {
+          success: true, account_count: accounts.length, payer_matches: payerMatches,
+        });
+        if (!payerMatches) {
+          throw stagedError(
+            "wallet_account_check",
+            "The selected MetaMask account does not match the account that paid.",
+          );
+        }
+      } catch (error) {
+        if (error && error.proofStage) throw error;
+        await report("proof_accounts_failed", {
+          success: false, error_stage: "wallet_account_check", error_name: errorName(error),
+        });
+        throw stagedError(
+          "wallet_account_check",
+          "MetaMask could not confirm the account that made the payment.",
+          error,
+        );
+      }
       const payload = createPaymentPayload(paymentRequired, accepted, transaction, payer);
       const typed = buildPaymentProofTypedData(payload, true);
       options.setStatus("Confirm the x402 payment proof in MetaMask…\nThis binds your payment to this exact coffee request.");
-      payload.payload.signature = await ethereum.request({
-        method: "eth_signTypedData_v4", params: [payer, JSON.stringify(typed)],
+      await report("proof_typed_data_requested", { transaction: transaction });
+      let signature;
+      let digest;
+      try {
+        signature = await ethereum.request({
+          method: "eth_signTypedData_v4", params: [payer, JSON.stringify(typed)],
+        });
+        requireValue(typeof signature === "string" && signature.length > 0, "MetaMask returned no proof signature");
+      } catch (error) {
+        await report("proof_signature_failed", {
+          success: false, signature_present: false,
+          error_stage: "typed_data_signature", error_name: errorName(error),
+        });
+        throw stagedError(
+          "typed_data_signature",
+          "MetaMask did not return the x402 payment proof signature.",
+          error,
+        );
+      }
+      try {
+        digest = await signatureHash(signature);
+      } catch (_) {
+        digest = null; // Presence remains observable if hashing is unavailable.
+      }
+      await report("proof_signature_returned", {
+        success: true, signature_present: true, signature_sha256: digest,
       });
-      const response = await fetch(resourceUrl, {
-        method: "GET", cache: "no-store", credentials: "omit",
-        headers: { "PAYMENT-SIGNATURE": encodeHeader(payload) },
+      payload.payload.signature = signature;
+      await report("proof_retry_started", {
+        transaction: transaction, signature_present: true, signature_sha256: digest,
       });
+      let response;
+      try {
+        response = await fetch(resourceUrl, {
+          method: "GET", cache: "no-store", credentials: "omit",
+          headers: { "PAYMENT-SIGNATURE": encodeHeader(payload) },
+        });
+        await report("proof_retry_fetch_succeeded", { success: true });
+      } catch (error) {
+        await report("proof_retry_fetch_failed", {
+          success: false, error_stage: "signed_retry_fetch", error_name: errorName(error),
+        });
+        throw stagedError(
+          "signed_retry_fetch",
+          "The signed x402 request could not reach the coffee server. Check the connection and try again.",
+          error,
+        );
+      }
+      await report("proof_retry_http_received", { http_status: response.status });
       const responseHeader = response.headers.get("PAYMENT-RESPONSE");
-      requireValue(response.status === 200 && responseHeader, "x402 server did not return HTTP 200 with PAYMENT-RESPONSE");
-      validatePaymentResponse(decodeHeader(responseHeader), transaction, payer);
+      await report("proof_payment_response_checked", {
+        http_status: response.status, payment_response_present: Boolean(responseHeader),
+      });
+      if (response.status !== 200) {
+        throw stagedError(
+          "signed_retry_http",
+          "The coffee server rejected the signed x402 request (HTTP " + response.status + ").",
+        );
+      }
+      if (!responseHeader) {
+        throw stagedError(
+          "payment_response",
+          "The coffee server response was missing PAYMENT-RESPONSE.",
+        );
+      }
+      try {
+        validatePaymentResponse(decodeHeader(responseHeader), transaction, payer);
+      } catch (error) {
+        throw stagedError(
+          "payment_response_validation",
+          "The x402 payment response did not match this payment.",
+          error,
+        );
+      }
       options.setStatus("Paid. Coffee authorized.\n" + options.shortHex(transaction), "ok");
       options.hideProof();
     }

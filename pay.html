@@ -89,7 +89,7 @@
   <div id="status"></div>
 
 <script src="vendor/ethers.umd.min.js?v=a66293a6a2bb4dee"></script>
-<script src="phone-x402.js?v=74f7c7d230371bdf"></script>
+<script src="phone-x402.js?v=91af0127d0b207aa"></script>
 <script>
 // Professor's pay page (merged/ui/www/pay.html): MetaMask Mobile drops a
 // custom 4-arg ethereum: URI, so this page builds payForSession via ethers
@@ -348,7 +348,10 @@ const X402_FLOW = CryptoCoffeePhoneX402.createHumanWalletFlow({
     document.getElementById("x402TermsRow").hidden = false;
     document.getElementById("x402TermsDisplay").textContent = text;
   },
-  showProof: function () { document.getElementById("proofBtn").hidden = false; },
+  showProof: function () {
+    document.getElementById("payBtn").hidden = true;
+    document.getElementById("proofBtn").hidden = false;
+  },
   hideProof: function () { document.getElementById("proofBtn").hidden = true; },
   setStatus: setStatus,
   shortHex: shortHex,
@@ -395,6 +398,7 @@ async function pay() {
       { value: txTerms.value }
     );
     HUMAN_TX = tx.hash;
+    payBtn.hidden = true;
     if (X402_FLOW.enabled) await X402_FLOW.transactionSubmitted(tx.hash, payer);
     setStatus("Submitted " + shortHex(tx.hash) + "\nWaiting for the payment to be included…");
 
@@ -409,6 +413,7 @@ async function pay() {
       setStatus("Transaction reverted on-chain: " + shortHex(tx.hash), "err");
       HUMAN_TX = null;
       X402_FLOW.resetPayment();
+      payBtn.hidden = false;
       payBtn.disabled = false;
     }
   } catch (err) {
@@ -423,7 +428,8 @@ async function signX402Proof() {
   try {
     await X402_FLOW.signProof(injectedProvider());
   } catch (err) {
-    setStatus("Error: " + friendlyError(err), "err");
+    var stage = err && err.proofStage ? " at " + err.proofStage.replace(/_/g, " ") : "";
+    setStatus("x402 proof stopped" + stage + ": " + (err.userMessage || friendlyError(err)), "err");
     proofBtn.disabled = false;
   }
 }
