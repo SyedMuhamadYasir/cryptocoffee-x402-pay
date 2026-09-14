@@ -1,0 +1,507 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover">
+<meta name="cryptocoffee-public-pay-version" content="human-x402-public-reliability-v1">
+<title>CryptoCoffee — pay</title>
+<style>
+  :root {
+    --bg: #17130f; --panel: #1f1a15; --ink: #f3ede4; --ink-dim: #a89a89;
+    --copper: #e2924f; --success: #6fb98f; --warn: #d97757; --border: #332a20;
+  }
+  * { box-sizing: border-box; }
+  html {
+    overflow-x: hidden;
+    -webkit-text-size-adjust: 100%;
+    text-size-adjust: 100%;
+  }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font-family: -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    padding: 2rem 1.5rem; display: grid; gap: 1.2rem;
+    width: 100%; max-width: 480px; margin-inline: auto;
+    min-height: 100vh; align-content: start;
+    overflow-x: hidden; overflow-wrap: anywhere;
+  }
+  header {
+    display: grid;
+    gap: 0.55rem;
+    justify-items: center;
+    text-align: center;
+  }
+  h1 { font-size: 1.2rem; margin: 0; }
+  .brand-logo {
+    display: block;
+    width: min(9rem, 46vw);
+    height: auto;
+    aspect-ratio: 1;
+    object-fit: contain;
+  }
+  .amount { font-size: 1.6rem; color: var(--copper); font-weight: 600; }
+  .card {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
+    padding: 1.2rem 1.3rem; display: grid; gap: 0.6rem;
+    min-width: 0;
+  }
+  .row { display: flex; justify-content: space-between; font-size: 0.85rem; color: var(--ink-dim); gap: 1rem; min-width: 0; }
+  .row b { color: var(--ink); font-weight: 500; overflow-wrap: anywhere; word-break: break-word; text-align: right; min-width: 0; }
+  button {
+    font: inherit; font-size: 1rem; padding: 0.9rem 1rem; border-radius: 10px;
+    border: 1px solid var(--copper); background: transparent; color: var(--copper);
+    cursor: pointer; font-weight: 600; max-width: 100%;
+  }
+  button.primary {
+    background: var(--copper); border-color: var(--copper); color: #17130f;
+  }
+  button:disabled { opacity: 0.5; cursor: default; }
+  button.link { display: block; text-align: center; text-decoration: none; }
+  #status {
+    font-size: 0.9rem; line-height: 1.5; white-space: pre-wrap;
+    overflow-wrap: anywhere; word-break: break-word; max-width: 100%;
+  }
+  #status.ok { color: var(--success); }
+  #status.err { color: var(--warn); }
+  #mmHandoffHelp { margin: 0.8rem 0 0; color: var(--ink-dim); font-size: 0.85rem; line-height: 1.4; }
+  a { color: var(--copper); }
+  [hidden] { display: none !important; }
+</style>
+</head>
+<body>
+  <header>
+    <img class="brand-logo" src="../assets/bcc-logo.svg?v=2c6a1a6763635725" alt="UZH Blockchain Center" width="2126" height="2126">
+    <h1>CryptoCoffee — pay for your session</h1>
+  </header>
+  <div class="card">
+    <div class="row"><span>Amount</span><b id="amountDisplay">—</b></div>
+    <div class="row"><span>Network</span><b id="networkDisplay">—</b></div>
+    <div class="row"><span>Machine</span><b id="machineDisplay">—</b></div>
+    <div class="row"><span>Session</span><b id="sessionDisplay">—</b></div>
+    <div class="row" id="x402TermsRow" hidden><span>x402</span><b id="x402TermsDisplay">Checking payment terms...</b></div>
+  </div>
+
+  <button id="payBtn" class="primary" type="button" hidden>Pay 0.010 UZHETH with MetaMask</button>
+  <button id="retryX402Btn" class="primary" type="button" hidden>Retry finishing x402</button>
+
+  <div id="noWallet" class="card" hidden>
+    <p>MetaMask is not in this browser. Install the extension, or open this page in MetaMask’s in-app browser:</p>
+    <a id="mmLink" class="link" href="#"><button type="button">Open in MetaMask</button></a>
+    <p id="mmHandoffHelp" hidden>MetaMask opened but did not load this payment page? Tap “Open in MetaMask” again.</p>
+  </div>
+  <div id="status"></div>
+
+<script src="../vendor/ethers.umd.min.js?v=a66293a6a2bb4dee"></script>
+<script src="phone-x402.js?v=c5293e293b08eb3c"></script>
+<script src="handoff-reliability.js?v=3801d8d4bc459c2d"></script>
+<script>
+// Professor's pay page (merged/ui/www/pay.html): MetaMask Mobile drops a
+// custom 4-arg ethereum: URI, so this page builds payForSession via ethers
+// inside a wallet-injected browser. ABI is THIS repo's uint64 deadline,
+// not the professor contract's uint256.
+const params = new URLSearchParams(location.search);
+let CONTRACT = params.get("contract");
+let CHAIN_ID = parseInt(params.get("chainId"), 10);
+let SESSION_ID = params.get("sessionId");
+let MACHINE_ID = params.get("machineId");
+let AMOUNT = params.get("amount");
+let DEADLINE = params.get("deadline");
+let WALLET_RPC = params.get("rpc") || "";
+let CHAIN_NAME = params.get("chainName") || "UZH Ethereum PoS";
+let COIN_SYMBOL = params.get("symbol") || "UZHETHs";
+let MACHINE_LABEL = params.get("machineLabel") || "";
+let HUMAN_TX = null;
+
+const ABI = ["function payForSession(bytes32 sessionId, bytes32 machineId, uint256 expectedAmount, uint64 deadline) external payable"];
+
+function fmtAmount(wei) {
+  try { return ethers.utils.formatEther(wei) + " " + COIN_SYMBOL; } catch { return wei + " wei"; }
+}
+
+function shortHex(v) {
+  if (!v) return "—";
+  v = String(v);
+  return v.length > 12 ? v.slice(0, 10) + "…" + v.slice(-4) : v;
+}
+
+function friendlyError(err) {
+  if (!err) return "Unknown error";
+  var reason = err.reason || (err.error && err.error.message);
+  if (reason && reason !== "execution reverted") return String(reason);
+  var msg = err.message ? String(err.message) : String(err);
+  var cut = msg.search(/\s*\[ See:/);
+  if (cut > 0) msg = msg.slice(0, cut).trim();
+  cut = msg.search(/\s*\(reason=/);
+  if (cut > 0) msg = msg.slice(0, cut).trim();
+  if (msg.length > 160) msg = msg.slice(0, 157) + "…";
+  return msg;
+}
+
+function renderInvoice() {
+  document.getElementById("amountDisplay").textContent = AMOUNT ? fmtAmount(AMOUNT) : "—";
+  document.getElementById("networkDisplay").textContent = invoiceReady() ? CHAIN_NAME : "—";
+  document.getElementById("machineDisplay").textContent = MACHINE_LABEL || shortHex(MACHINE_ID);
+  document.getElementById("sessionDisplay").textContent = shortHex(SESSION_ID);
+}
+
+const statusEl = document.getElementById("status");
+function setStatus(text, cls) {
+  statusEl.textContent = text;
+  statusEl.className = cls || "";
+}
+
+function invoiceReady() {
+  return CONTRACT && SESSION_ID && MACHINE_ID && AMOUNT && DEADLINE && CHAIN_ID;
+}
+
+function applyWalletConnect(wc) {
+  CONTRACT = wc.contract;
+  CHAIN_ID = parseInt(wc.chain_id, 10);
+  SESSION_ID = wc.session_id_hex;
+  MACHINE_ID = wc.machine_id_hex;
+  MACHINE_LABEL = wc.machine_id || "";
+  AMOUNT = String(wc.amount);
+  DEADLINE = String(wc.deadline);
+  WALLET_RPC = wc.wallet_rpc_url || WALLET_RPC;
+  if (wc.chain_name) CHAIN_NAME = wc.chain_name;
+  if (wc.native_symbol) COIN_SYMBOL = wc.native_symbol;
+}
+
+function parseEip681(uri) {
+  if (!uri || uri.indexOf("ethereum:") !== 0) return false;
+  var addr = uri.split(":")[1].split("@")[0];
+  var chainId = parseInt(uri.split("@")[1].split("/")[0], 10);
+  var qs = uri.slice(uri.indexOf("?") + 1).split("&");
+  var b32 = [], out = {};
+  qs.forEach(function (kv) {
+    var i = kv.indexOf("="), k = kv.slice(0, i), v = kv.slice(i + 1);
+    if (k === "bytes32") b32.push(v); else out[k] = v;
+  });
+  if (b32.length < 2 || !out.uint256 || !out.uint64) return false;
+  CONTRACT = addr;
+  CHAIN_ID = chainId;
+  SESSION_ID = b32[0];
+  MACHINE_ID = b32[1];
+  AMOUNT = out.value || out.uint256;
+  DEADLINE = out.uint64;
+  return true;
+}
+
+// Benjamin's public page accommodates MetaMask Mobile injecting its provider
+// after page load. x402 deliberately reuses that wallet-discovery behavior.
+let ETH = null;
+
+function looksLikeMetaMaskBrowser() {
+  try { return /MetaMask/i.test(navigator.userAgent || ""); } catch (e) { return false; }
+}
+
+function injectedProvider() {
+  if (ETH) return ETH;
+  var eth = window.ethereum;
+  if (!eth) return null;
+  if (eth.providers && eth.providers.length) {
+    for (var i = 0; i < eth.providers.length; i++) {
+      if (eth.providers[i] && eth.providers[i].isMetaMask) return eth.providers[i];
+    }
+    return eth.providers[0];
+  }
+  return eth;
+}
+
+function rememberProvider(p) {
+  if (p) ETH = p;
+}
+
+function exactPaymentPageUrl() {
+  return location.origin + location.pathname + location.search + location.hash;
+}
+
+function handoffStorageKey() {
+  return "cryptocoffee:mm-handoff:" + (params.get("session") || SESSION_ID || location.pathname);
+}
+
+function handoffWasAttempted() {
+  try { return sessionStorage.getItem(handoffStorageKey()) === exactPaymentPageUrl(); }
+  catch (e) { return false; }
+}
+
+function rememberHandoffAttempt() {
+  try { sessionStorage.setItem(handoffStorageKey(), exactPaymentPageUrl()); }
+  catch (e) { /* A blocked sessionStorage must not block wallet handoff. */ }
+}
+
+function reportHandoffEvent(name, details) {
+  if (!X402_FLOW.enabled) return;
+  void X402_FLOW.reportHandoffEvent(name, details || {});
+}
+
+function showPayOrWalletPrompt() {
+  renderInvoice();
+  var payBtn = document.getElementById("payBtn");
+  var noWallet = document.getElementById("noWallet");
+  var deepLink = CryptoCoffeePhoneX402.buildMetaMaskDappLink(exactPaymentPageUrl());
+  document.getElementById("mmLink").href = deepLink;
+  if (!invoiceReady()) {
+    payBtn.hidden = true;
+    noWallet.hidden = true;
+    setStatus("Waiting for an invoice on the kiosk — tap a drink there, then come back.", "err");
+    return;
+  }
+  var eth = injectedProvider();
+  if (eth) rememberProvider(eth);
+  // The ordinary mobile browser is a handoff surface, not a failing payment
+  // surface. Only reveal Pay after an injected provider is actually present.
+  payBtn.hidden = !eth;
+  payBtn.textContent = X402_FLOW.enabled ? "Pay 0.010 UZHETH with MetaMask" : "Pay with MetaMask";
+  payBtn.disabled = X402_FLOW.enabled && !X402_FLOW.isVerified();
+  if (eth || looksLikeMetaMaskBrowser()) {
+    noWallet.hidden = true;
+    if (!X402_FLOW.enabled) {
+      setStatus(eth ? "MetaMask is ready. Tap Pay and confirm in the extension." : "Connecting to MetaMask…", "ok");
+    }
+  } else {
+    noWallet.hidden = false;
+    document.getElementById("mmHandoffHelp").hidden = !handoffWasAttempted();
+    if (!X402_FLOW.enabled) setStatus("No wallet yet — tap Pay anyway if MetaMask is installed, or open it below.");
+  }
+}
+
+function watchForWallet() {
+  function onFound(p) {
+    var provider = p && p.request ? p : (p && p.detail && p.detail.provider) || injectedProvider();
+    rememberProvider(provider);
+    reportHandoffEvent("metamask_payment_page_loaded_in_context", { provider_present: Boolean(provider) });
+    if (provider) reportHandoffEvent("metamask_injected_provider_detected", { provider_present: true });
+    showPayOrWalletPrompt();
+  }
+  window.addEventListener("ethereum#initialized", function () { onFound(window.ethereum); }, { once: true });
+  window.addEventListener("eip6963:announceProvider", function (event) {
+    var d = event.detail || {};
+    var info = d.info || {};
+    var provider = d.provider;
+    if (provider && (info.rdns === "io.metamask" || /metamask/i.test(info.name || "") || provider.isMetaMask)) {
+      onFound(provider);
+    } else if (provider && !ETH) {
+      onFound(provider);
+    }
+  });
+  try { window.dispatchEvent(new Event("eip6963:requestProvider")); } catch (e) {}
+  if (injectedProvider()) {
+    onFound(injectedProvider());
+    return;
+  }
+  var n = 0;
+  var t = setInterval(function () {
+    n += 1;
+    if (injectedProvider()) {
+      clearInterval(t);
+      onFound(injectedProvider());
+    } else if (n >= 50) {
+      clearInterval(t);
+    }
+  }, 200);
+}
+
+function waitForProvider(ms) {
+  var already = injectedProvider();
+  if (already) return Promise.resolve(already);
+  return new Promise(function (resolve) {
+    var done = false;
+    function finish() {
+      if (done) return;
+      done = true;
+      resolve(injectedProvider());
+    }
+    window.addEventListener("ethereum#initialized", finish, { once: true });
+    var started = Date.now();
+    var t = setInterval(function () {
+      if (injectedProvider() || Date.now() - started >= ms) {
+        clearInterval(t);
+        finish();
+      }
+    }, 100);
+  });
+}
+
+async function loadFromKiosk() {
+  if (invoiceReady()) return true;
+  try {
+    const r = await fetch("status.json?_=" + Date.now(), { cache: "no-store" });
+    const data = await r.json();
+    if (data.status !== "awaiting_payment") return false;
+    if (data.wallet_connect) applyWalletConnect(data.wallet_connect);
+    else if (data.payment_uri) parseEip681(data.payment_uri);
+    return invoiceReady();
+  } catch (e) {
+    return false;
+  }
+}
+
+async function ensureChain(provider) {
+  const network = await provider.getNetwork();
+  if (network.chainId === CHAIN_ID) return;
+  const hexChainId = "0x" + CHAIN_ID.toString(16);
+  var eth = injectedProvider();
+  if (!eth) throw new Error("MetaMask is not connected.");
+  try {
+    await eth.request({ method: "wallet_switchEthereumChain", params: [{ chainId: hexChainId }] });
+  } catch (switchErr) {
+    if (switchErr.code === 4902 && WALLET_RPC) {
+      await eth.request({
+        method: "wallet_addEthereumChain",
+        params: [{
+          chainId: hexChainId,
+          chainName: CHAIN_NAME,
+          rpcUrls: [WALLET_RPC],
+          nativeCurrency: { name: COIN_SYMBOL, symbol: COIN_SYMBOL, decimals: 18 },
+        }],
+      });
+    } else {
+      throw switchErr;
+    }
+  }
+}
+
+const X402_FLOW = CryptoCoffeePhoneX402.createHumanWalletFlow({
+  params: params,
+  getInvoice: function () {
+    return { contract: CONTRACT, chainId: CHAIN_ID, sessionId: SESSION_ID,
+      machineId: MACHINE_ID, amount: AMOUNT, deadline: DEADLINE };
+  },
+  applyTransactionTerms: function (terms) {
+    CONTRACT = terms.contractAddress;
+    SESSION_ID = terms.sessionIdBytes32;
+    MACHINE_ID = terms.machineIdBytes32;
+    AMOUNT = terms.amount;
+    DEADLINE = terms.deadline;
+    renderInvoice();
+  },
+  showTerms: function (text) {
+    document.getElementById("x402TermsRow").hidden = false;
+    document.getElementById("x402TermsDisplay").textContent = text;
+  },
+  showRetry: function () { document.getElementById("retryX402Btn").hidden = false; },
+  hideRetry: function () { document.getElementById("retryX402Btn").hidden = true; },
+  setStatus: setStatus,
+  shortHex: shortHex,
+});
+
+async function pay() {
+  const payBtn = document.getElementById("payBtn");
+  payBtn.disabled = true;
+  try {
+    if (!invoiceReady()) {
+      await loadFromKiosk();
+    }
+    if (!invoiceReady()) {
+      setStatus("No live invoice — tap a drink on the kiosk first.", "err");
+      payBtn.disabled = false;
+      return;
+    }
+    if (X402_FLOW.enabled && !X402_FLOW.isVerified()) throw new Error("x402 payment terms are not verified");
+    if (HUMAN_TX) throw new Error("this page already submitted its one payment");
+    setStatus("Connecting wallet...");
+    var eth = injectedProvider() || await waitForProvider(8000);
+    if (!eth) {
+      setStatus("MetaMask did not connect. Reload this page inside MetaMask.", "err");
+      payBtn.disabled = false;
+      return;
+    }
+    rememberProvider(eth);
+    const provider = new ethers.providers.Web3Provider(eth, "any");
+    await provider.send("eth_requestAccounts", []);
+    await ensureChain(provider);
+    const signer = provider.getSigner();
+    const payer = await signer.getAddress();
+    const txTerms = X402_FLOW.enabled
+      ? X402_FLOW.transactionTerms()
+      : { contractAddress: CONTRACT, sessionIdBytes32: SESSION_ID, machineIdBytes32: MACHINE_ID, amount: String(AMOUNT), deadline: String(DEADLINE), value: String(AMOUNT) };
+    const contract = new ethers.Contract(txTerms.contractAddress, ABI, signer);
+
+    setStatus("Confirm the transaction in your wallet...");
+    const tx = await contract.payForSession(
+      txTerms.sessionIdBytes32,
+      txTerms.machineIdBytes32,
+      txTerms.amount,
+      txTerms.deadline,
+      { value: txTerms.value }
+    );
+    HUMAN_TX = tx.hash;
+    payBtn.hidden = true;
+    if (X402_FLOW.enabled) await X402_FLOW.transactionSubmitted(tx.hash, payer);
+    setStatus("Submitted " + shortHex(tx.hash) + "\nWaiting for the payment to be included…");
+
+    const receipt = await tx.wait();
+    if (receipt.status === 1) {
+      if (X402_FLOW.enabled) {
+        await X402_FLOW.paymentIncluded(provider, receipt, tx.hash, payer);
+      } else {
+        setStatus("Paid. Go back to the kiosk.\n" + shortHex(tx.hash), "ok");
+      }
+    } else {
+      setStatus("Transaction reverted on-chain: " + shortHex(tx.hash), "err");
+      HUMAN_TX = null;
+      X402_FLOW.resetPayment();
+      payBtn.hidden = false;
+      payBtn.disabled = false;
+    }
+  } catch (err) {
+    setStatus("Error: " + friendlyError(err), "err");
+    payBtn.disabled = !!HUMAN_TX;
+    if (HUMAN_TX && X402_FLOW.enabled) document.getElementById("retryX402Btn").hidden = false;
+  }
+}
+
+async function retryX402Completion() {
+  const retryBtn = document.getElementById("retryX402Btn");
+  retryBtn.disabled = true;
+  try {
+    setStatus("Payment confirmed. Finishing x402…", "ok");
+    await X402_FLOW.finishPayment();
+  } catch (err) {
+    var stage = err && err.x402Stage ? " at " + err.x402Stage.replace(/_/g, " ") : "";
+    setStatus("x402 completion stopped" + stage + ": " + (err.userMessage || friendlyError(err)), "err");
+    retryBtn.disabled = false;
+  }
+}
+
+document.getElementById("payBtn").addEventListener("click", pay);
+document.getElementById("retryX402Btn").addEventListener("click", retryX402Completion);
+document.getElementById("mmLink").addEventListener("click", function () {
+  var retry = handoffWasAttempted();
+  rememberHandoffAttempt();
+  document.getElementById("mmHandoffHelp").hidden = false;
+  reportHandoffEvent(
+    retry ? "metamask_handoff_retry_clicked" : "metamask_open_clicked",
+    { retry: retry, provider_present: Boolean(injectedProvider()) }
+  );
+});
+
+(async function init() {
+  if (!invoiceReady()) {
+    setStatus("Looking up the kiosk invoice…");
+    await loadFromKiosk();
+  }
+  if (invoiceReady() && X402_FLOW.enabled) {
+    try {
+      await X402_FLOW.verify();
+    } catch (err) {
+      document.getElementById("x402TermsRow").hidden = false;
+      document.getElementById("x402TermsDisplay").textContent = "Payment disabled";
+      setStatus("Payment disabled: " + friendlyError(err), "err");
+    }
+  }
+  showPayOrWalletPrompt();
+  watchForWallet();
+  if (!injectedProvider()) {
+    reportHandoffEvent("metamask_payment_page_loaded_without_provider", { provider_present: false });
+  }
+  if (!invoiceReady()) {
+    setInterval(async function () {
+      if (invoiceReady()) return;
+      if (await loadFromKiosk()) showPayOrWalletPrompt();
+    }, 700);
+  }
+})();
+</script>
+</body>
+</html>
